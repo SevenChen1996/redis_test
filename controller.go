@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"sync"
@@ -173,14 +172,13 @@ var fpgaBitstreamDowloadMutex sync.Mutex
 
 func SetFpgaBitstream(response http.ResponseWriter, request *http.Request) {
 	type fpgaBitsteamInfo struct {
-		PartialFlag bool `json:"partial_flag"`
-		HasWrapper  bool `json:"has_wrapper"`
+		PartialFlag   bool  `json:"partial_flag"`
+		PartionNumber uint8 `json:"partion_number"`
 	}
-
+	const partionNumMax = 2
 	readJsonFlag := false
 	readFileFlag := false
 	var fileName string
-	var binFile *os.File
 
 	if request.Method == "POST" {
 		mpReader, err := request.MultipartReader()
@@ -195,14 +193,19 @@ func SetFpgaBitstream(response http.ResponseWriter, request *http.Request) {
 			if part.Header.Get("Content-Type") == "application/json" {
 				jsonContent, err := ioutil.ReadAll(part)
 				if err != nil {
-					log.Printf("ioutil.ReadAll failed!")
+					log.Printf("%s:ioutil.ReadAll failed!", getCurrentFuncName())
 					return
 				}
 				part.Close()
 
 				err = json.Unmarshal(jsonContent, fpgaBitstreamInfoData)
 				if err != nil {
-					log.Printf("json.Unmarshal failed!")
+					log.Printf("%s:json.Unmarshal failed!", getCurrentFuncName())
+					return
+				}
+
+				if fpgaBitstreamInfoData.PartionNumber >= partionNumMax {
+					log.Printf("%s:fpgaBitstreamInfoData.PartionNumber is larger than partionNumMax(%d)!", getCurrentFuncName(), partionNumMax)
 					return
 				}
 
@@ -239,52 +242,32 @@ func SetFpgaBitstream(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 
-			if fpgaBitstreamInfoData.HasWrapper {
-				bifFile, err := ioutil.TempFile("", "bitstream.bif")
-				if err != nil {
-					log.Printf("%s:ioutil.TempFile failed!", getCurrentFuncName())
-					return
-				}
-				defer os.Remove(bifFile.Name())
-				defer bifFile.Close()
-
-				reg, _ := regexp.Compile("xxxx")
-				BifFileContent := "all:{\n\t xxxx \n}"
-				BifFileContent = reg.ReplaceAllString(BifFileContent, file.Name())
-				_, err = bifFile.Write([]byte(BifFileContent))
-				if err != nil {
-					log.Printf("%s:", getCurrentFuncName())
-					return
-				}
-				err = bifFile.Sync()
-				if err != nil {
-					log.Printf("%s:bifFile.Sync failed!", getCurrentFuncName())
-					return
-				}
-
-				binFileName := fileName + ".bin"
-				binFile, err = ioutil.TempFile("", binFileName)
-				if err != nil {
-					log.Printf("%s:ioutil.TempFile failed!", getCurrentFuncName())
-					return
-				}
-				binFile.Close()
-				//defer os.Remove(binFile.Name())
-
-				cmd := exec.Command("bootgen", " -image "+bifFile.Name()+" -arch zynq -o "+binFile.Name()+" -w")
-				err = cmd.Run()
-				if err != nil {
-					log.Printf("%s:exec.Command failed!", getCurrentFuncName())
-					return
-				}
-			} else {
-				binFile = file
-			}
 
 			fpgaBitstreamDowloadMutex.Lock()
 			defer fpgaBitstreamDowloadMutex.Unlock()
+
 			if fpgaBitstreamInfoData.PartialFlag {
-				echoCmd := exec.Command("echo 1 > /sys/class/fpga_manager/fpga0/flags")
+				echoCmd := exec.Command("/bin/sh", "-c", "echo \"1\" > /sys/devices/soc0/amba/f8007000.devcfg/is_partial_bitstream")
+				err = echoCmd.Run()
+				if err != nil {
+					log.Printf("%s:echoCmd.Run() failed!", getCurrentFuncName())
+					return
+				}
+			}
+			defer func() {
+				if fpgaBitstreamInfoData.PartialFlag {
+					echoCmd := exec.Command("/bin/sh", "-c", "echo \"0\" > /sys/devices/soc0/amba/f8007000.devcfg/is_partial_bitstream")
+					err = echoCmd.Run()
+					if err != nil {
+						log.Printf("%s:echoCmd.Run() failed!", getCurrentFuncName())
+						return
+					}
+				}
+			}()
+
+			//decoupler
+			if fpgaBitstreamInfoData.PartialFlag {
+				echoCmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("echo on > /sys/class/pr_ctrl/pr_ctrl%d/decoupler_state",fpgaBitstreamInfoData.PartionNumber))
 				err = echoCmd.Run()
 				if err != nil {
 					log.Printf("%s:echoCmd.Run() failed!", getCurrentFuncName())
@@ -292,30 +275,29 @@ func SetFpgaBitstream(response http.ResponseWriter, request *http.Request) {
 				}
 			}
 
-			mkdirPDirCmd := exec.Command("mkdir","-p /lib/firmware")
-			err = mkdirPDirCmd.Run()
+			defer func() {
+				if fpgaBitstreamInfoData.PartialFlag {
+					echoCmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("echo off > /sys/class/pr_ctrl/pr_ctrl%d/decoupler_state",fpgaBitstreamInfoData.PartionNumber))
+					err = echoCmd.Run()
+					if err != nil {
+						log.Printf("%s:echoCmd.Run() failed!", getCurrentFuncName())
+						return
+					}
+				}
+			}()
+
+			copyToXdevcfgCmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("cat %s > /dev/xdevcfg", file.Name()))
+			err = copyToXdevcfgCmd.Run()
 			if err != nil {
-				log.Printf("%s:mkdirPDirCmd.Run() failed!", getCurrentFuncName())
+				log.Printf("%s:copyToXdevcfgCmd.Run() failed!", getCurrentFuncName())
 				return
 			}
 
-			//cpToFirmwareDir := exec.Command("cp",""
-			
-
-			if fpgaBitstreamInfoData.PartialFlag {
-				echoCmd := exec.Command("echo 0 > /sys/class/fpga_manager/fpga0/flags")
-				err = echoCmd.Run()
-				if err != nil {
-					log.Printf("%s:echoCmd.Run() failed!", getCurrentFuncName())
-					return
-				}
-			}
-			fpgaBitstreamDowloadMutex.Unlock()
-
 		} else {
 			log.Printf("%s:lack of parameter!", getCurrentFuncName())
+			return
 		}
-		return
+
 	} else {
 		log.Printf("%s only support method 'POST'", getCurrentFuncName())
 		return
